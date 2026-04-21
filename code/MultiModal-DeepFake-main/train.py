@@ -308,7 +308,13 @@ def main_worker(gpu, args, config):
     if gpu is not None:
         args.gpu = gpu
 
-    init_dist(args)
+    if args.distributed:
+        init_dist(args)
+    else:
+        args.gpu = 0
+        args.rank = 0
+        args.log = True
+        torch.cuda.set_device(0)
     log_dir = os.path.join(args.output_dir, 'log'+ args.log_num)
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, 'shell.txt')

@@ -8,7 +8,7 @@ import random
 
 from models import box_ops
 from tools.multilabel_metrics import get_multi_label
-from consist_modeling import get_sscore_label, get_sscore_label_text
+from .consist_modeling import get_sscore_label, get_sscore_label_text
 from timm.models.layers import trunc_normal_
 from .METER import METERTransformerSS
 from torch.nn import CrossEntropyLoss, BCELoss
