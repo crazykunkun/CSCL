@@ -4,8 +4,8 @@ val_file: ["/root/autodl-tmp/datasets/DGM4/metadata/test.json"]
 image_res: 256
 vision_width: 768
 embed_dim: 256
-batch_size_train: 64
-batch_size_val: 256
+batch_size_train: 16
+batch_size_val: 64
 max_words: 50
 
 loss_BIC_wgt: 1

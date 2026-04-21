@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+from torch.cuda.amp import autocast, GradScaler
 
 import utils
 from dataset import create_dataset, create_sampler, create_loader
@@ -97,7 +98,7 @@ def text_input_adjust(text_input, fake_word_pos, device):
     return text_input, fake_token_pos_batch
 
 
-def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer):
+def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, scaler):
     # train
     model.train()  
     
@@ -126,23 +127,25 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
             scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)        
 
         optimizer.zero_grad()
-        
-        image = image.to(device,non_blocking=True) 
-        
-        text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
-        
+
+        image = image.to(device,non_blocking=True)
+
+        text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False)
+
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
-        
-        loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)  
-            
-        loss = config['loss_BIC_wgt']*loss_BIC \
-             + config['loss_bbox_wgt']*loss_bbox \
-             + config['loss_giou_wgt']*loss_giou \
-             + config['loss_MLC_wgt']*loss_MLC \
-             + config['Loss_sim_wgt']*Loss_sim\
-        
-        loss.backward()
-        optimizer.step()    
+
+        with autocast(dtype=torch.bfloat16):
+            loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)
+
+            loss = config['loss_BIC_wgt']*loss_BIC \
+                 + config['loss_bbox_wgt']*loss_bbox \
+                 + config['loss_giou_wgt']*loss_giou \
+                 + config['loss_MLC_wgt']*loss_MLC \
+                 + config['Loss_sim_wgt']*Loss_sim\
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()    
         
         metric_logger.update(loss_BIC=loss_BIC.item())
         metric_logger.update(loss_bbox=loss_bbox.item())
@@ -351,7 +354,7 @@ def main_worker(gpu, args, config):
     train_loader, val_loader = create_loader([train_dataset, val_dataset],
                                 samplers,
                                 batch_size=[config['batch_size_train']]+[config['batch_size_val']], 
-                                num_workers=[4, 4], 
+                                num_workers=[8, 4],
                                 is_trains=[True, False], 
                                 collate_fns=[None, None])
 
@@ -389,13 +392,17 @@ def main_worker(gpu, args, config):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
+    scaler = GradScaler()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     if args.log:
         print("Start training")
     start_time = time.time()
 
     for epoch in range(start_epoch, max_epoch):
             
-        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
+        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer, scaler)
         AUC_cls, ACC_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
@@ -507,7 +514,7 @@ if __name__ == '__main__':
     parser.add_argument('--text_encoder', default='/root/autodl-tmp/model/roberta-base')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
-    parser.add_argument('--distributed', default=True, type=bool)
+    parser.add_argument('--distributed', default=False, type=bool)
     parser.add_argument('--rank', default=0, type=int,
                         help='node rank for distributed training')
     parser.add_argument('--world_size', default=1, type=int,
