@@ -1,5 +1,5 @@
-train_file: ["../../datasets/DGM4/metadata/trainval.json"] # use train and val set together
-val_file: ["../../datasets/DGM4/metadata/test.json"]      
+train_file: ["/root/autodl-tmp/datasets/DGM4/metadata/trainval.json"] # use train and val set together
+val_file: ["/root/autodl-tmp/datasets/DGM4/metadata/test.json"]      
 
 image_res: 256
 vision_width: 768

@@ -383,7 +383,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', default='') 
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='./results')
-    parser.add_argument('--text_encoder', default='./roberta-base')
+    parser.add_argument('--text_encoder', default='/root/autodl-tmp/model/roberta-base')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
     parser.add_argument('--distributed', default=False, type=bool)
