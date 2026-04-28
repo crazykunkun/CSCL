@@ -1,0 +1,95 @@
+flowchart LR
+  %% Frequency-guided CSCL architecture
+  classDef image fill:#ffe5e5,stroke:#d62728,stroke-width:2px,color:#111;
+  classDef text fill:#e8f6e8,stroke:#2ca02c,stroke-width:2px,color:#111;
+  classDef freq fill:#f1e6ff,stroke:#7b2cbf,stroke-width:2px,color:#111;
+  classDef fusion fill:#fff4cc,stroke:#d4a017,stroke-width:2px,color:#111;
+  classDef head fill:#f2f2f2,stroke:#333,stroke-width:1.5px,color:#111;
+  classDef block fill:#ffffff,stroke:#111,stroke-width:1.5px,color:#111;
+
+  I[Image Input]:::image
+  T[Text Input]:::text
+
+  subgraph METER[Multi-modal Encoder]
+    IE[Image Encoder]:::image
+    TE[Text Encoder]:::text
+    CMI[Cross-modal Interaction]:::block
+    VCLS[V_cls]:::image
+    VPAT[V_pat<br/>Image Patch Tokens]:::image
+    TCLS[T_cls]:::text
+    TTOK[T_tok<br/>Text Token Features]:::text
+    CLS[Fused CLS Feature]:::fusion
+  end
+
+  I --> IE --> CMI
+  T --> TE --> CMI
+  CMI --> VCLS
+  CMI --> VPAT
+  CMI --> TCLS
+  CMI --> TTOK
+  CMI --> CLS
+
+  subgraph FB[Frequency Branch]
+    SRM[SRM Residual]:::freq
+    DCT[DCT High-frequency]:::freq
+    FFT[FFT High-pass]:::freq
+    WAV[Haar Wavelet]:::freq
+    CAT[Concat 8-channel<br/>Frequency Maps]:::freq
+    FE[Frequency Encoder<br/>CNN + ConvNeXt Blocks]:::freq
+    FPAT[F_pat<br/>Frequency Tokens]:::freq
+    FSCORE[Freq Patch Scores]:::freq
+    FCONS[Freq Consistency Features]:::freq
+  end
+
+  I --> SRM --> CAT
+  I --> DCT --> CAT
+  I --> FFT --> CAT
+  I --> WAV --> CAT
+  CAT --> FE
+  FE --> FPAT
+  FE --> FSCORE
+  FE --> FCONS
+
+  FGF[Frequency Guided Fusion<br/>Cross Attention + Gate + Residual]:::fusion
+  VPAT --> FGF
+  FPAT --> FGF
+  FGF --> FVPAT[Ṽ_pat<br/>Fused Image Tokens]:::fusion
+
+  subgraph CCD[Contextual Consistency Decoder]
+    ICP[Image Consistency Processor]:::image
+    IMAT[M_pat<br/>Image Consistency Matrix]:::image
+    IREASON[Image Forgery-aware Reasoning<br/>Reliable / Suspicious Blocks]:::image
+    TCP[Text Consistency Processor]:::text
+    TMAT[M_tok<br/>Text Consistency Matrix]:::text
+    TREASON[Text Forgery-aware Reasoning<br/>Reliable / Suspicious Blocks]:::text
+  end
+
+  FVPAT --> ICP --> IMAT --> IREASON
+  TTOK --> TCP --> TMAT --> TREASON
+
+  subgraph SCD[Semantic Consistency Decoder]
+    ISC[Image Semantic Consistency<br/>S_pat with T_g]:::image
+    IAGG[Image Forgery-aware Aggregating]:::image
+    TSC[Text Semantic Consistency<br/>S_tok with V_g]:::text
+    TAGG[Text Forgery-aware Aggregating]:::text
+  end
+
+  IREASON --> ISC --> IAGG --> VA[Ṽ_a<br/>Aggregated Image Feature]:::image
+  TREASON --> TSC --> TAGG --> TA[T̃_a<br/>Aggregated Text Feature]:::text
+  TREASON -. text global token .-> ISC
+  IREASON -. image global token .-> TSC
+
+  BIC[Binary Classifier<br/>Real / Fake]:::head
+  IMGCLS[FS / FA Classifier]:::head
+  BBOX[BBox Detector<br/>Forged Region Box]:::head
+  TXTCLS[TS / TA Classifier]:::head
+  TOK[Token Localization<br/>Forged Text Tokens]:::head
+
+  CLS --> BIC
+  VA --> IMGCLS
+  VA --> BBOX
+  TA --> TXTCLS
+  TA --> TOK
+
+  FSCORE -. Loss_freq_patch .-> FGF
+  FCONS -. Loss_freq_matrix .-> FGF

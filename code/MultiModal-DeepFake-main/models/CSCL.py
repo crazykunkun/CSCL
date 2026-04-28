@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 import numpy as np
 import random
+from torch.cuda.amp import autocast
 
 from models import box_ops
 from tools.multilabel_metrics import get_multi_label
@@ -13,6 +14,7 @@ from timm.models.layers import trunc_normal_
 from .METER import METERTransformerSS
 from torch.nn import CrossEntropyLoss, BCELoss
 from .consist_modeling import Intra_Modal_Modeling, Extra_Modal_Modeling
+from .frequency_branch import FrequencyGuidedFusion
 import math
 import yaml
 def score2posemb1d(pos, num_pos_feats=768, temperature=10000):
@@ -49,8 +51,10 @@ def coords_2d(x_size, y_size):
     
 def get_weighted_bce_loss(prediction, gt):
     loss = nn.BCELoss(reduction='none')
-
-    class_loss = loss(prediction, gt) 
+    with autocast(enabled=False):
+        prediction = prediction.float()
+        gt = gt.float()
+        class_loss = loss(prediction, gt) 
 
     weights = torch.ones_like(gt)
     w_negative = gt.sum()/gt.size(0) 
@@ -73,8 +77,10 @@ def get_it_bce_loss(prediction, gt):
     mask = (gt==-100)
     prediction = prediction[~mask]
     gt = 1 - gt[~mask]
-    
-    class_loss = loss(prediction, gt) 
+    with autocast(enabled=False):
+        prediction = prediction.float()
+        gt = gt.float()
+        class_loss = loss(prediction, gt) 
 
     weights = torch.ones_like(gt)
     w_negative = gt.sum()/gt.size(0) 
@@ -124,6 +130,12 @@ class CSCL(nn.Module):
         # extra_modeling
         self.img_extra_model = Extra_Modal_Modeling(12, vision_width, 16)
         self.text_extra_model = Extra_Modal_Modeling(12, vision_width, 8)
+        self.freq_fusion = FrequencyGuidedFusion(
+            token_dim=vision_width,
+            hidden_dim=config.get('freq_hidden_dim', 128),
+            num_heads=config.get('freq_num_heads', 8),
+            token_grid=16,
+        )
         
         self.emb_img_pos = nn.Sequential(
             nn.Linear(text_width*2, text_width),
@@ -134,7 +146,6 @@ class CSCL(nn.Module):
             nn.Linear(text_width, text_width),
             nn.LayerNorm(text_width)
         )
-
         self.apply(self._init_weights)
 
         # init METER #
@@ -186,8 +197,37 @@ class CSCL(nn.Module):
             num_boxes = torch.sum(1 - is_image)
             loss_bbox = loss_bbox * (1 - is_image.view(-1, 1))
             loss_giou = loss_giou * (1 - is_image)
+            if num_boxes.item() == 0:
+                zero = output_coord.sum() * 0.0
+                return zero, zero
 
         return loss_bbox.sum() / num_boxes, loss_giou.sum() / num_boxes
+
+    def build_text_logits(self, sim_score_text):
+        clipped_scores = torch.clamp(sim_score_text, 0, 1)
+        threshold = clipped_scores.new_tensor(0.5)
+        scale = clipped_scores.new_tensor(1.0)
+        genuine_logits = (clipped_scores - threshold) * scale
+        fake_logits = (threshold - clipped_scores) * scale
+        return torch.stack([genuine_logits, fake_logits], dim=-1)
+
+    def get_frequency_loss(self, freq_scores, freq_consist_feats, patch_label, sim_matrix_img):
+        with autocast(enabled=False):
+            patch_gt = patch_label.float().clamp(0, 1)
+            freq_scores = freq_scores.float().clamp(1e-6, 1 - 1e-6)
+            patch_loss = F.binary_cross_entropy(freq_scores, patch_gt, reduction='none')
+            pos_ratio = (patch_gt >= 0.5).float().mean().detach()
+            weights = torch.ones_like(patch_gt)
+            weights[patch_gt >= 0.5] = 1 - pos_ratio
+            weights[patch_gt < 0.5] = pos_ratio
+            Loss_freq_patch = (weights * patch_loss).mean()
+
+            norms = torch.norm(freq_consist_feats.float(), p=2, dim=2, keepdim=True).clamp_min(1e-6)
+            normalized_feats = freq_consist_feats.float() / norms
+            freq_matrix = torch.bmm(normalized_feats, normalized_feats.transpose(1, 2))
+            freq_matrix = torch.clamp((freq_matrix + 1) / 2, 1e-6, 1 - 1e-6)
+            Loss_freq_matrix, _, _ = get_weighted_bce_loss(freq_matrix.view(-1), sim_matrix_img.float().view(-1))
+        return Loss_freq_patch + Loss_freq_matrix
     
     def get_cos_sim(self, vectors):
         norms = torch.norm(vectors, p=2, dim=2, keepdim=True)
@@ -205,6 +245,7 @@ class CSCL(nn.Module):
         return sim_score, patch_score, img_score
     
     def forward(self, image, label, text, fake_image_box, fake_text_pos, is_train=True):
+        fake_image_box = fake_image_box.to(image.device)
         if is_train:
             
             ##================= multi-label convert ========================## 
@@ -223,7 +264,10 @@ class CSCL(nn.Module):
                         token_label[batch_idx, pos] = 1
 
             multicls_label, real_label_pos = get_multi_label(label, image)
-            sim_matrix_img, patch_label, _, _, _ = get_sscore_label(image, fake_image_box,token_label)
+            non_image_label_pos = np.where((np.array(label) == 'orig') | (np.array(label) == 'text_swap') | (np.array(label) == 'text_attribute'))[0].tolist()
+            is_image = torch.zeros(len(label), dtype=torch.float, device=image.device)
+            is_image[non_image_label_pos] = 1
+            sim_matrix_img, patch_label, _, _, _ = get_sscore_label(image, fake_image_box, token_label)
             sim_matrix_text, sim_matrix_text_mask = get_sscore_label_text(token_label)
             ##================= METER ========================## 
             batch={}
@@ -250,6 +294,7 @@ class CSCL(nn.Module):
             image_atts_mask_bool = (image_atts==0)
             patch_pos_emb = self.emb_img_pos(pos2posemb2d(coords_2d(16, 16).to(fusion_token.device).unsqueeze(0).repeat(bs,1,1)))
             img_patch_feat = image_embeds_output[:,1:,:]
+            img_patch_feat, freq_scores, freq_consist_feats = self.freq_fusion(image, img_patch_feat)
             img_patch_feat, img_matrix_pred, _ = self.img_intra_model(img_patch_feat, image_atts_mask_bool[:,1:], patch_pos_emb)
             len_text = text_embeds_output.shape[1]-1
             token_pos_emb = self.emb_text_pos(score2posemb1d(torch.arange(0, len_text, dtype=torch.float).to(text_embeds_output.device).unsqueeze(1).repeat(bs,1,1)))
@@ -265,12 +310,14 @@ class CSCL(nn.Module):
 
             Loss_img_score, _, _ = get_it_bce_loss(sim_score_img.view(-1), patch_label.view(-1).float())
             Loss_text_score, _, _ = get_it_bce_loss(sim_score_text.view(-1), token_label.view(-1).float())
+            Loss_freq = self.get_frequency_loss(freq_scores, freq_consist_feats, patch_label, sim_matrix_img)
+            logits_tok = self.build_text_logits(sim_score_text)
 
             Loss_sim = Loss_img_score + Loss_img_matrix + Loss_text_score + Loss_text_matrix
             ##================= IMG ========================##
 
             output_coord = self.bbox_head(agger_feat_img.squeeze(1)).sigmoid()
-            loss_bbox, loss_giou = self.get_bbox_loss(output_coord, fake_image_box)
+            loss_bbox, loss_giou = self.get_bbox_loss(output_coord, fake_image_box, is_image=is_image)
             output_cls_img = self.cls_head_img(agger_feat_img.squeeze(1))
             loss_MLC_img = F.binary_cross_entropy_with_logits(output_cls_img, multicls_label.type(torch.float)[:, :2])
 
@@ -281,7 +328,7 @@ class CSCL(nn.Module):
 
             ##================= MLC ========================## 
             loss_MLC = loss_MLC_img + loss_MLC_text
-            return loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim
+            return loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim, Loss_freq
 
         else:
             
@@ -312,6 +359,7 @@ class CSCL(nn.Module):
             image_atts_mask_bool = (image_atts==0)
             patch_pos_emb = self.emb_img_pos(pos2posemb2d(coords_2d(16, 16).to(fusion_token.device).unsqueeze(0).repeat(bs,1,1)))
             img_patch_feat = image_embeds_output[:,1:,:]
+            img_patch_feat, _, _ = self.freq_fusion(image, img_patch_feat)
             img_patch_feat, img_matrix_pred, _ = self.img_intra_model(img_patch_feat, image_atts_mask_bool[:,1:], patch_pos_emb)
             len_text = text_embeds_output.shape[1]-1
             token_pos_emb = self.emb_text_pos(score2posemb1d(torch.arange(0, len_text, dtype=torch.float).to(text_embeds_output.device).unsqueeze(1).repeat(bs,1,1)))
@@ -328,11 +376,7 @@ class CSCL(nn.Module):
             ##================= TMG ========================##  
             logits_multicls_text = self.cls_head_text(agger_feat_text.squeeze(1))
             ##==============logit merge=====================##
-            it_sim_score = torch.clamp(sim_score_text, 0, 1).unsqueeze(-1)
-            it_sim_score = (it_sim_score > 0.5).float() # threshold is 0.5
-            it_sim_score_convert = 1 - it_sim_score
-            it_sim_score = torch.cat([it_sim_score, it_sim_score_convert], dim=-1)
-            logits_tok = it_sim_score
+            logits_tok = self.build_text_logits(sim_score_text)
 
             ##================= MLC ========================## 
             logits_multicls = torch.cat([logits_multicls_img, logits_multicls_text], dim=-1)
@@ -341,4 +385,3 @@ class CSCL(nn.Module):
             logits_multicls_mask = ((logits_multicls[:, 0]<0.5)&(logits_multicls[:, 1]<0.5))
             output_coord[logits_multicls_mask] = torch.tensor([0.0, 0.0, 0.0, 0.0]).to(output_coord.device)
             return logits_real_fake, logits_multicls, output_coord, logits_tok
-

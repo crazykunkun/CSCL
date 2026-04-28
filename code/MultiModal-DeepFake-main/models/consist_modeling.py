@@ -47,7 +47,8 @@ def calculate_patch_labels(images, boxes, fake_text_pos, num_patches=(16, 16)):
 
     # 计算相交区域的面积
 
-    inter_area = torch.max(torch.tensor(0), inter_x2 - inter_x1).unsqueeze(1) * torch.max(torch.tensor(0), inter_y2 - inter_y1).unsqueeze(2)
+    zero = torch.tensor(0, device=boxes.device)
+    inter_area = torch.max(zero, inter_x2 - inter_x1).unsqueeze(1) * torch.max(zero, inter_y2 - inter_y1).unsqueeze(2)
 
     # 判断条件：相交面积是否大于 patch 面积的一半
     labels = (inter_area > (patch_area / 2)).int()
@@ -63,11 +64,44 @@ def calculate_patch_labels(images, boxes, fake_text_pos, num_patches=(16, 16)):
 
     return consistency_matrix, consistency_matrix_it, labels.view(images.shape[0], -1)
 
-def get_sscore_label(img, fake_img_box, fake_text_pos, len_edge=16):
-    consistency_matrix, consistency_matrix_it, labels = calculate_patch_labels(img,fake_img_box,fake_text_pos,(len_edge,len_edge))
+def _expand_patch_labels(labels, target_edge):
+    current_edge = labels.shape[1]
+    if current_edge == target_edge:
+        return labels
+    scale = target_edge // current_edge
+    return labels.repeat_interleave(scale, dim=1).repeat_interleave(scale, dim=2)
 
-    patch_score = consistency_matrix.sum(dim=-1)/(len_edge*len_edge)
-    img_score = patch_score.sum(dim=-1)/(len_edge*len_edge)
+
+def _build_consistency_from_labels(labels):
+    flat_labels = labels.view(labels.shape[0], -1).float()
+    consistency_matrix = (flat_labels.unsqueeze(-1) == flat_labels.unsqueeze(1)).float()
+    return consistency_matrix, flat_labels
+
+
+def get_sscore_label(img, fake_img_box, fake_text_pos, len_edge=16, multi_scales=(16, 8)):
+    consistency_matrices = []
+    expanded_labels = []
+    consistency_matrix_it = None
+
+    for scale in multi_scales:
+        scale_consistency_matrix, scale_consistency_matrix_it, scale_labels = calculate_patch_labels(
+            img,
+            fake_img_box,
+            fake_text_pos,
+            (scale, scale),
+        )
+        scale_labels = scale_labels.view(img.shape[0], scale, scale)
+        expanded_scale_labels = _expand_patch_labels(scale_labels, len_edge)
+        expanded_consistency_matrix, expanded_flat_labels = _build_consistency_from_labels(expanded_scale_labels)
+        consistency_matrices.append(expanded_consistency_matrix)
+        expanded_labels.append(expanded_flat_labels)
+        if scale == len_edge:
+            consistency_matrix_it = scale_consistency_matrix_it
+
+    consistency_matrix = torch.stack(consistency_matrices, dim=0).mean(dim=0)
+    labels = torch.stack(expanded_labels, dim=0).mean(dim=0)
+    patch_score = consistency_matrix.sum(dim=-1) / (len_edge * len_edge)
+    img_score = patch_score.sum(dim=-1) / (len_edge * len_edge)
 
     return consistency_matrix, labels, patch_score, img_score, consistency_matrix_it
 
@@ -99,6 +133,7 @@ class Intra_Modal_Modeling(nn.Module):
         self.aggregator_2 = nn.MultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
         self.aggregator_mlp_2 = self.build_mlp(input_dim=output_dim, output_dim=output_dim)
         self.num_head = 4
+        self.fixed_token_number = tok_num
 
     def build_mlp(self, input_dim, output_dim):
         return nn.Sequential(
@@ -110,6 +145,23 @@ class Intra_Modal_Modeling(nn.Module):
             nn.GELU(),
             nn.Linear(input_dim * 2, output_dim)
         )
+
+    def build_fixed_attn_mask(self, scores, largest, valid_count):
+        batch_size, num_tokens, _ = scores.shape
+        sorted_indices = torch.argsort(scores, dim=-1, descending=largest)
+        rank_index = torch.arange(num_tokens, device=scores.device).view(1, 1, num_tokens)
+        fixed_k = torch.clamp(
+            torch.minimum(
+                torch.full_like(valid_count.long(), self.fixed_token_number),
+                valid_count.long(),
+            ),
+            min=1,
+        )
+
+        keep_mask = rank_index < fixed_k.unsqueeze(-1)
+        attn_mask = torch.ones(batch_size, num_tokens, num_tokens, dtype=torch.bool, device=scores.device)
+        attn_mask.scatter_(-1, sorted_indices, ~keep_mask)
+        return attn_mask.repeat(self.num_head, 1, 1)
     
     def forward(self, feats, mask, pos_emb, matrix_mask=None):
         
@@ -123,6 +175,8 @@ class Intra_Modal_Modeling(nn.Module):
         similarity_matrix = torch.clamp((similarity_matrix+1)/2, 0, 1)
 
         if mask.sum() > 0: # for text inputs
+            valid_count = (~mask).sum(dim=-1, keepdim=True) - 1
+            valid_count = torch.clamp(valid_count, min=1).expand(-1, N)
             similarity_matrix_unsim = similarity_matrix.clone()
             similarity_matrix_unsim[~matrix_mask] = 2
 
@@ -132,24 +186,14 @@ class Intra_Modal_Modeling(nn.Module):
             similarity_matrix_sim = similarity_matrix_sim - diagonal_mask
 
         else: # for image inputs
+            valid_count = torch.full((B, N), N - 1, device=feats.device, dtype=torch.long)
             similarity_matrix_unsim = similarity_matrix.clone()
             similarity_matrix_sim = similarity_matrix.clone()
             diagonal_mask = torch.eye(N, device=feats.device).unsqueeze(0).expand(B, N, N)
             similarity_matrix_sim = similarity_matrix_sim - diagonal_mask # ignore them self
 
-        unsim_feats_index = torch.topk(similarity_matrix_unsim, self.token_number, dim=-1, largest=False)[1]
-        unsim_attn_mask = torch.ones([B, N, N], dtype=torch.bool).to(unsim_feats_index.device)
-        batch_indices = torch.arange(B).view(B, 1, 1) # 形状 (B, N, m)
-        row_indices = torch.arange(N).view(1, N, 1)   # 形状 (B, N, m)
-        unsim_attn_mask[batch_indices, row_indices, unsim_feats_index] = False
-        unsim_attn_mask = unsim_attn_mask.repeat(self.num_head ,1,1)
-
-        sim_feats_index = torch.topk(similarity_matrix_sim, self.token_number, dim=-1, largest=True)[1]
-        sim_attn_mask = torch.ones([B, N, N], dtype=torch.bool).to(sim_feats_index.device)
-        batch_indices = torch.arange(B).view(B, 1, 1) # 形状 (B, N, m)
-        row_indices = torch.arange(N).view(1, N, 1)   # 形状 (B, N, m)
-        sim_attn_mask[batch_indices, row_indices, sim_feats_index] = False
-        sim_attn_mask = sim_attn_mask.repeat(self.num_head ,1,1)
+        unsim_attn_mask = self.build_fixed_attn_mask(similarity_matrix_unsim, largest=False, valid_count=valid_count)
+        sim_attn_mask = self.build_fixed_attn_mask(similarity_matrix_sim, largest=True, valid_count=valid_count)
         
         feats = feats + self.aggregator_mlp(self.aggregator(query=feats, 
                                               key=feats, 
@@ -201,6 +245,7 @@ class Extra_Modal_Modeling(nn.Module):
         self.aggregator_mlp = self.build_mlp(input_dim=output_dim, output_dim=output_dim)
         self.aggregator_2 = nn.MultiheadAttention(output_dim, 4, dropout=0.0, batch_first=True)
         self.aggregator_mlp_2 = self.build_mlp(input_dim=output_dim, output_dim=output_dim)
+        self.fixed_token_number = tok_num
 
         trunc_normal_(self.cls_token_cross, std=.02)
         trunc_normal_(self.cls_token_feat, std=.02)
@@ -215,6 +260,23 @@ class Extra_Modal_Modeling(nn.Module):
             nn.GELU(),
             nn.Linear(input_dim * 2, output_dim)
         )
+
+    def compute_fixed_k(self, valid_count):
+        fixed_k = torch.minimum(
+            torch.full_like(valid_count.long(), self.fixed_token_number),
+            valid_count.long(),
+        )
+        return torch.clamp(fixed_k, min=1)
+
+    def gather_fixed_tokens(self, feats, scores, fixed_k, largest):
+        batch_size, num_tokens, _ = feats.shape
+        sorted_index = torch.argsort(scores, dim=-1, descending=largest)
+        max_k = int(fixed_k.max().item())
+        selected_index = sorted_index[:, :max_k]
+        gather_index = selected_index.unsqueeze(-1).expand(-1, -1, feats.shape[-1])
+        selected_tokens = feats.gather(1, gather_index)
+        selected_mask = torch.arange(max_k, device=feats.device).view(1, max_k) >= fixed_k.unsqueeze(-1)
+        return selected_tokens, selected_mask
     
     def forward(self, feats, gloabl_feature, cross_feat, feats_mask, cross_mask):
         
@@ -235,7 +297,7 @@ class Extra_Modal_Modeling(nn.Module):
         norms_feat = torch.norm(feats_consist, p=2, dim=2, keepdim=True)
         norms_cross = torch.norm(cross_feats_consist, p=2, dim=2, keepdim=True)
         sim_matrix = torch.bmm(feats_consist/norms_feat, (cross_feats_consist/norms_cross).transpose(1, 2))
-        sim_matrix = torch.clamp((sim_matrix+1)/2, 0, 1).squeeze()
+        sim_matrix = torch.clamp((sim_matrix+1)/2, 0, 1).squeeze(-1)
 
         cls_token = self.cls_token_feat.expand(bs, -1, -1)
         global_feats_mask = torch.zeros(feats_mask.shape[0], 1).bool().to(feats_mask.device)
@@ -250,23 +312,25 @@ class Extra_Modal_Modeling(nn.Module):
 
             unsim_score = sim_matrix.clone()
             unsim_score[feats_mask] = 2
+            valid_count = (~feats_mask).sum(dim=-1)
 
         else: # for image inputs
             sim_score = sim_matrix.clone()
             unsim_score = sim_matrix.clone()
+            valid_count = torch.full((feats.shape[0],), feats.shape[1], device=feats.device, dtype=torch.long)
 
-        unsim_index = torch.topk(unsim_score, self.token_number, dim=-1, largest=False)[1]
-        unsim_patch = feats[torch.arange(feats.shape[0]).unsqueeze(1), unsim_index]
-
-        sim_index = torch.topk(sim_score, self.token_number, dim=-1, largest=True)[1]
-        sim_patch = feats[torch.arange(feats.shape[0]).unsqueeze(1), sim_index]
+        fixed_k = self.compute_fixed_k(valid_count)
+        unsim_patch, unsim_patch_mask = self.gather_fixed_tokens(feats, unsim_score, fixed_k, largest=False)
+        sim_patch, sim_patch_mask = self.gather_fixed_tokens(feats, sim_score, fixed_k, largest=True)
 
         feat_aggr = feat_aggr + self.aggregator_mlp(self.aggregator(query=feat_aggr, 
                                               key=sim_patch, 
-                                              value=sim_patch)[0])
+                                              value=sim_patch,
+                                              key_padding_mask=sim_patch_mask)[0])
         
         feat_aggr = feat_aggr + self.aggregator_mlp_2(self.aggregator_2(query=feat_aggr, 
                                               key=unsim_patch, 
-                                              value=unsim_patch)[0])
+                                              value=unsim_patch,
+                                              key_padding_mask=unsim_patch_mask)[0])
         
         return feat_aggr, sim_matrix, feats_consist

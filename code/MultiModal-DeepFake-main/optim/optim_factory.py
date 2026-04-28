@@ -72,7 +72,7 @@ def add_weight_lr_img(args, model, weight_decay=1e-5, skip_list=()):
         # else:
         #     decay.append(param)
                     
-        if ("visual_encoder" in name) or ("bbox_head" in name) or ("aggregator" in name) or ("cls_token_local" in name) or ("it_cross_attn" in name) or ("norm_layer_aggr" in name) or ("norm_layer_it_cross_atten" in name):
+        if ("visual_encoder" in name) or ("bbox_head" in name) or ("aggregator" in name) or ("cls_token_local" in name) or ("it_cross_attn" in name) or ("norm_layer_aggr" in name) or ("norm_layer_it_cross_atten" in name) or ("img_intra_model" in name) or ("img_extra_model" in name) or ("freq_fusion" in name) or ("fusion_head" in name) or ("itm_head" in name) or ("cls_head_img" in name) or ("cls_head_text" in name):
             lr_vis.append(param)
         else:
             lr_text.append(param)

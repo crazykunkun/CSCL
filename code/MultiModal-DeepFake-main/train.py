@@ -44,6 +44,90 @@ from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 from models.CSCL import CSCL
 from transformers import RobertaTokenizerFast
 
+
+def set_trainable_scope(model, scope):
+    if scope == 'all':
+        for param in model.parameters():
+            param.requires_grad = True
+        return
+
+    if scope == 'freq_only':
+        trainable_prefixes = (
+            'freq_fusion',
+            'img_intra_model',
+            'img_extra_model',
+            'bbox_head',
+        )
+    elif scope == 'freq_iou':
+        trainable_prefixes = (
+            'freq_fusion',
+            'img_intra_model',
+            'img_extra_model',
+            'bbox_head',
+        )
+    elif scope == 'freq_aux_iou':
+        trainable_prefixes = (
+            'freq_fusion',
+            'img_intra_model',
+            'img_extra_model',
+            'bbox_head',
+        )
+    elif scope == 'freq_image_heads':
+        trainable_prefixes = (
+            'freq_fusion',
+            'img_intra_model',
+            'img_extra_model',
+            'fusion_head',
+            'itm_head',
+            'bbox_head',
+            'cls_head_img',
+            'cls_head_text',
+        )
+    else:
+        raise ValueError(f'Unsupported train scope: {scope}')
+
+    for name, param in model.named_parameters():
+        param.requires_grad = name.startswith(trainable_prefixes)
+
+
+def freeze_meter_backbone(model):
+    frozen_count = 0
+    frozen_params = 0
+    for name, param in model.named_parameters():
+        if name.startswith('meter.'):
+            param.requires_grad = False
+            frozen_count += 1
+            frozen_params += param.numel()
+    return frozen_count, frozen_params
+
+
+def filter_meter_state_dict(state_dict):
+    return {name: param for name, param in state_dict.items() if name.startswith('meter.')}
+
+
+def count_parameters(module):
+    return sum(p.numel() for p in module.parameters())
+
+
+def count_trainable_parameters(module):
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
+def write_progress(progress_path, **kwargs):
+    serializable = {}
+    for key, value in kwargs.items():
+        if isinstance(value, (np.floating, np.integer)):
+            serializable[key] = value.item()
+        else:
+            serializable[key] = value
+    with open(progress_path, "w") as f:
+        json.dump(serializable, f)
+
+
+def format_eta(seconds):
+    seconds = max(0, int(seconds))
+    return str(datetime.timedelta(seconds=seconds))
+
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
     streamhandler = logging.StreamHandler()
@@ -98,9 +182,13 @@ def text_input_adjust(text_input, fake_word_pos, device):
     return text_input, fake_token_pos_batch
 
 
-def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, scaler):
+def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, device, scheduler, config, summary_writer, scaler, progress_path=None, logger=None):
     # train
-    model.train()  
+    model.train()
+    if hasattr(model, 'meter'):
+        meter_params = list(model.meter.parameters())
+        if meter_params and not any(param.requires_grad for param in meter_params):
+            model.meter.eval()
     
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
@@ -109,6 +197,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     metric_logger.add_meter('loss_giou', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_MLC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('Loss_sim', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('Loss_freq', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     
     header = 'Train Epoch: [{}]'.format(epoch)
@@ -117,11 +206,30 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     warmup_iterations = warmup_steps*step_size  
 
     global_step = epoch*len(data_loader)
-    
+    total_steps = config['schedular']['epochs'] * len(data_loader)
+    epoch_start_time = time.time()
+
     if args.distributed:
         data_loader.sampler.set_epoch(epoch)
 
     for i, (image, label, text, fake_image_box, fake_word_pos, W, H, image_path) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+        step_start_time = time.time()
+        should_log_batch = (i == 0 or i % print_freq == 0)
+        if progress_path is not None and (i == 0 or i % 50 == 0):
+            elapsed_epoch = time.time() - epoch_start_time
+            avg_step_time = elapsed_epoch / max(i + 1, 1)
+            epoch_eta_seconds = avg_step_time * max(len(data_loader) - i - 1, 0)
+            total_done_steps = epoch * len(data_loader) + i + 1
+            total_eta_seconds = avg_step_time * max(total_steps - total_done_steps, 0)
+            write_progress(
+                progress_path,
+                stage="train",
+                epoch=epoch,
+                batch=i,
+                total_batches=len(data_loader),
+                epoch_eta=format_eta(epoch_eta_seconds),
+                total_eta=format_eta(total_eta_seconds),
+            )
 
         if config['schedular']['sched'] == 'cosine_in_step':
             scheduler.adjust_learning_rate(optimizer, i / len(data_loader) + epoch, args, config)        
@@ -135,13 +243,19 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
 
         with autocast(dtype=torch.bfloat16):
-            loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model(image, label, text_input, fake_image_box, fake_token_pos)
+            model_outputs = model(image, label, text_input, fake_image_box, fake_token_pos)
+            if len(model_outputs) == 5:
+                loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim = model_outputs
+                Loss_freq = Loss_sim * 0.0
+            else:
+                loss_BIC, loss_bbox, loss_giou, loss_MLC, Loss_sim, Loss_freq = model_outputs
 
             loss = config['loss_BIC_wgt']*loss_BIC \
                  + config['loss_bbox_wgt']*loss_bbox \
                  + config['loss_giou_wgt']*loss_giou \
                  + config['loss_MLC_wgt']*loss_MLC \
-                 + config['Loss_sim_wgt']*Loss_sim\
+                 + config['Loss_sim_wgt']*Loss_sim \
+                 + config.get('Loss_freq_wgt', 0)*Loss_freq
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -152,8 +266,37 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         metric_logger.update(loss_giou=loss_giou.item())
         metric_logger.update(loss_MLC=loss_MLC.item())
         metric_logger.update(Loss_sim=Loss_sim.item())
+        metric_logger.update(Loss_freq=Loss_freq.item())
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
+        if logger is not None and should_log_batch:
+            elapsed_epoch = time.time() - epoch_start_time
+            avg_step_time = elapsed_epoch / max(i + 1, 1)
+            epoch_eta_seconds = avg_step_time * max(len(data_loader) - i - 1, 0)
+            total_done_steps = epoch * len(data_loader) + i + 1
+            total_eta_seconds = avg_step_time * max(total_steps - total_done_steps, 0)
+            logger.info(
+                'Train Epoch [{}/{}] Batch [{}/{}] | lr {:.8f} | '
+                'loss_BIC {:.4f} | loss_bbox {:.4f} | loss_giou {:.4f} | '
+                'loss_MLC {:.4f} | Loss_sim {:.4f} | Loss_freq {:.4f} | loss {:.4f} | avg_loss {:.4f} | '
+                'epoch_eta {} | total_eta {}'.format(
+                    epoch + 1,
+                    config['schedular']['epochs'],
+                    i,
+                    len(data_loader),
+                    optimizer.param_groups[0]["lr"],
+                    loss_BIC.item(),
+                    loss_bbox.item(),
+                    loss_giou.item(),
+                    loss_MLC.item(),
+                    Loss_sim.item(),
+                    Loss_freq.item(),
+                    loss.item(),
+                    metric_logger.meters['loss'].global_avg,
+                    format_eta(epoch_eta_seconds),
+                    format_eta(total_eta_seconds),
+                )
+            )
         
         if epoch==0 and i%step_size==0 and i<=warmup_iterations and config['schedular']['sched'] != 'cosine_in_step': 
             scheduler.step(i//step_size)   
@@ -170,6 +313,7 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
                 'loss_giou': loss_giou.item(),                                                                                                                                                                                               
                 'loss_MLC': loss_MLC.item(),  
                 'Loss_sim': Loss_sim.item(),  
+                'Loss_freq': Loss_freq.item(),  
                 'loss': loss.item(),                                                                                                  
                     } 
             for tag, value in lossinfo.items():
@@ -179,12 +323,36 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     metric_logger.synchronize_between_processes()
     if args.log:
         print("Averaged stats:", metric_logger.global_avg(), flush=True)     
+    if logger is not None:
+        epoch_elapsed = time.time() - epoch_start_time
+        logger.info(
+            'Train Epoch [{}/{}] averaged | loss_BIC {} | loss_bbox {} | loss_giou {} | loss_MLC {} | Loss_sim {} | Loss_freq {} | loss {} | epoch_time {}'.format(
+                epoch + 1,
+                config['schedular']['epochs'],
+                "{:.6f}".format(metric_logger.meters['loss_BIC'].global_avg),
+                "{:.6f}".format(metric_logger.meters['loss_bbox'].global_avg),
+                "{:.6f}".format(metric_logger.meters['loss_giou'].global_avg),
+                "{:.6f}".format(metric_logger.meters['loss_MLC'].global_avg),
+                "{:.6f}".format(metric_logger.meters['Loss_sim'].global_avg),
+                "{:.6f}".format(metric_logger.meters['Loss_freq'].global_avg),
+                "{:.6f}".format(metric_logger.meters['loss'].global_avg),
+                format_eta(epoch_elapsed),
+            )
+        )
+    if progress_path is not None:
+        write_progress(
+            progress_path,
+            stage="train_done",
+            epoch=epoch,
+            batch=len(data_loader),
+            total_batches=len(data_loader),
+        )
     return {k: "{:.6f}".format(meter.global_avg) for k, meter in metric_logger.meters.items()}    
 
 
 
 @torch.no_grad()
-def evaluation(args, model, data_loader, tokenizer, device, config):
+def evaluation(args, model, data_loader, tokenizer, device, config, logger=None):
     # test
     model.eval() 
     
@@ -208,6 +376,13 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     multi_label_meter.reset()
 
     for i, (image, label, text, fake_image_box, fake_word_pos, W, H, image_path) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
+        if logger is not None and (i == 0 or i % print_freq == 0):
+            logger.info(
+                'Evaluation Epoch progress Batch [{}/{}]'.format(
+                    i,
+                    len(data_loader),
+                )
+            )
         
         image = image.to(device,non_blocking=True) 
         
@@ -215,7 +390,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         
         text_input, fake_token_pos = text_input_adjust(text_input, fake_word_pos, device)
 
-        logits_real_fake, logits_multicls, output_coord, logits_tok, _ = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
+        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
 
         ##================= real/fake cls ========================## 
         cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
@@ -276,10 +451,18 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
 
     ##================= real/fake cls ========================## 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
-    AUC_cls = roc_auc_score(y_true, y_pred)
     ACC_cls = cls_acc_all / cls_nums_all
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
-    EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+    unique_classes = np.unique(y_true)
+    if len(unique_classes) >= 2:
+        AUC_cls = roc_auc_score(y_true, y_pred)
+        fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
+        if np.isnan(fpr).any() or np.isnan(tpr).any():
+            EER_cls = float('nan')
+        else:
+            EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+    else:
+        AUC_cls = float('nan')
+        EER_cls = float('nan')
     
     ##================= multi-label cls ========================## 
     MAP = multi_label_meter.value().mean()
@@ -318,6 +501,7 @@ def main_worker(gpu, args, config):
     log_dir = os.path.join(args.output_dir, 'log'+ args.log_num)
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, 'shell.txt')
+    progress_file = os.path.join(log_dir, 'progress.txt')
     logger = setlogger(log_file)
     yaml.dump(config, open(os.path.join(log_dir, 'config.yaml'), 'w')) 
     
@@ -346,6 +530,8 @@ def main_worker(gpu, args, config):
     start_epoch = 0
     max_epoch = config['schedular']['epochs']
     warmup_steps = config['schedular']['warmup_epochs']
+    best_iou_score = float('-inf')
+    best_epoch = -1
 
     #### Dataset #### 
     if args.log:
@@ -370,28 +556,43 @@ def main_worker(gpu, args, config):
         print(f"Creating CSCL")
     model = CSCL(args=args, config=config)
     model = model.to(device)   
-        
+    
+    if args.checkpoint:    
+        checkpoint = torch.load(args.checkpoint, map_location='cpu') 
+        state_dict = checkpoint['model']
+        if args.load_meter_only:
+            state_dict = filter_meter_state_dict(state_dict)
+        if args.log:
+            if args.load_meter_only:
+                print('load meter-only checkpoint weights from %s'%args.checkpoint)
+                print(f'loaded_meter_keys={len(state_dict)}')
+            else:
+                print('load checkpoint from %s'%args.checkpoint)  
+        msg = model.load_state_dict(state_dict, strict=False)
+        if args.log:
+            print(msg)  
+
+    set_trainable_scope(model, args.train_scope)
+    frozen_meter_tensors, frozen_meter_params = freeze_meter_backbone(model)
+    total_params = count_parameters(model)
+    trainable_params = count_trainable_parameters(model)
+    if args.log:
+        print(f'train_scope={args.train_scope}')
+        print(f'frozen_meter_tensors={frozen_meter_tensors}')
+        print(f'frozen_meter_params={frozen_meter_params}')
+        print(f'trainable_params={trainable_params} / {total_params} ({100 * trainable_params / total_params:.2f}%)')
+
     arg_opt = utils.AttrDict(config['optimizer'])
     optimizer = create_optimizer(arg_opt, model)
     arg_sche = utils.AttrDict(config['schedular'])
     lr_scheduler, _ = create_scheduler(arg_sche, optimizer)
     if config['schedular']['sched'] == 'cosine_in_step':
         args.lr = config['optimizer']['lr']
-    
-    if args.checkpoint:    
-        checkpoint = torch.load(args.checkpoint, map_location='cpu') 
-        state_dict = checkpoint['model']                       
-        if args.resume:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            start_epoch = checkpoint['epoch']+1         
 
-        # model.load_state_dict(state_dict)  
-        if args.log:
-            print('load checkpoint from %s'%args.checkpoint)  
-        msg = model.load_state_dict(state_dict, strict=False)
-        if args.log:
-            print(msg)  
+    if args.checkpoint and args.resume:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        start_epoch = checkpoint['epoch'] + 1
 
     model_without_ddp = model
     if args.distributed:
@@ -407,13 +608,54 @@ def main_worker(gpu, args, config):
     start_time = time.time()
 
     for epoch in range(start_epoch, max_epoch):
+        if args.log:
+            logger.info(f'===== Epoch {epoch + 1}/{max_epoch} started =====')
+        write_progress(
+            progress_file,
+            stage="epoch_start",
+            epoch=epoch,
+            batch=0,
+            total_batches=len(train_loader),
+            max_epoch=max_epoch,
+        )
             
-        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer, scaler)
+        train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer, scaler, progress_path=progress_file, logger=logger)
+        if args.log:
+            logger.info(f'===== Epoch {epoch + 1}/{max_epoch} training finished, starting evaluation =====')
+        write_progress(
+            progress_file,
+            stage="evaluation",
+            epoch=epoch,
+            batch=len(train_loader),
+            total_batches=len(train_loader),
+            max_epoch=max_epoch,
+        )
         AUC_cls, ACC_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
         ACC_tok, Precision_tok, Recall_tok, F1_tok \
-        = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+        = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config, logger=logger)
+        if args.log:
+            logger.info(
+                '===== Epoch {}/{} done | AUC {:.4f} | EER {:.4f} | ACC {:.4f} | mAP {:.4f} | '
+                'IOU {:.4f} | IOU@50 {:.4f} | IOU@75 {:.4f} | IOU@95 {:.4f} | '
+                'ACC_tok {:.4f} | Precision {:.4f} | Recall {:.4f} | F1 {:.4f} ====='.format(
+                    epoch + 1,
+                    max_epoch,
+                    AUC_cls * 100,
+                    EER_cls * 100,
+                    ACC_cls * 100,
+                    MAP * 100,
+                    IOU_score * 100,
+                    IOU_ACC_50 * 100,
+                    IOU_ACC_75 * 100,
+                    IOU_ACC_95 * 100,
+                    ACC_tok * 100,
+                    Precision_tok * 100,
+                    Recall_tok * 100,
+                    F1_tok * 100,
+                )
+            )
 
         #============ tensorboard train log info ============#
         if args.log:
@@ -498,18 +740,53 @@ def main_worker(gpu, args, config):
                     'epoch': epoch,
                 }                    
 
-            torch.save(save_obj, os.path.join(log_dir, 'checkpoint_latest.pth')) 
+            torch.save(save_obj, os.path.join(log_dir, 'checkpoint_latest.pth'))
+
+            if IOU_score > best_iou_score:
+                best_iou_score = IOU_score
+                best_epoch = epoch
+                save_obj['best_iou_score'] = best_iou_score
+                save_obj['best_epoch'] = best_epoch
+                torch.save(save_obj, os.path.join(log_dir, 'checkpoint_best.pth'))
+                if args.log:
+                    logger.info(
+                        '===== New best model at epoch {}/{} | IOU {:.4f} ====='.format(
+                            epoch + 1,
+                            max_epoch,
+                            IOU_score * 100,
+                        )
+                    )
+
+            write_progress(
+                progress_file,
+                stage="epoch_done",
+                epoch=epoch,
+                batch=len(train_loader),
+                total_batches=len(train_loader),
+                max_epoch=max_epoch,
+                AUC_cls=round(AUC_cls * 100, 4),
+                MAP=round(MAP * 100, 4),
+                IOU_score=round(IOU_score * 100, 4),
+                F1_tok=round(F1_tok * 100, 4),
+                best_IOU_score=round(best_iou_score * 100, 4),
+                best_epoch=best_epoch + 1,
+            )
 
         if config['schedular']['sched'] != 'cosine_in_step':
             lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier() 
+        if args.distributed:
+            dist.barrier() 
 
     if utils.is_main_process():
-        torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch))   
+        save_obj['best_iou_score'] = best_iou_score
+        save_obj['best_epoch'] = best_epoch
+        torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch))
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     if args.log:
         print('Training time {}'.format(total_time_str))
+        logger.info(f'Training time {total_time_str}')
+    write_progress(progress_file, stage="finished", max_epoch=max_epoch)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -532,6 +809,8 @@ if __name__ == '__main__':
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm', 'mpi'], default='none',
                         help='job launcher')
     parser.add_argument('--log_num', default='new', type=str)
+    parser.add_argument('--train_scope', choices=['all', 'freq_image_heads', 'freq_only', 'freq_iou', 'freq_aux_iou'], default='all')
+    parser.add_argument('--load_meter_only', action='store_true')
 
     args = parser.parse_args()
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
