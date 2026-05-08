@@ -245,18 +245,21 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     IOU_ACC_75 = sum(IOU_75)/len(IOU_75)
     IOU_ACC_95 = sum(IOU_95)/len(IOU_95)
     # ##================= token cls========================##
-    ACC_tok = (TP_all + TN_all) / (TP_all + TN_all + FP_all + FN_all)
-    Precision_tok = TP_all / (TP_all + FP_all)
-    Recall_tok = TP_all / (TP_all + FN_all)
-    F1_tok = 2*Precision_tok*Recall_tok / (Precision_tok + Recall_tok)
+    def safe_divide(numerator, denominator):
+        return numerator / denominator if denominator != 0 else 0.0
+
+    ACC_tok = safe_divide(TP_all + TN_all, TP_all + TN_all + FP_all + FN_all)
+    Precision_tok = safe_divide(TP_all, TP_all + FP_all)
+    Recall_tok = safe_divide(TP_all, TP_all + FN_all)
+    F1_tok = safe_divide(2 * Precision_tok * Recall_tok, Precision_tok + Recall_tok)
     ##================= multi-label cls ========================## 
     MAP = multi_label_meter.value().mean()
     OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
             
     for cls_idx in range(logits_multicls.shape[1]):
-        Precision_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FP_all_multicls[cls_idx])
-        Recall_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FN_all_multicls[cls_idx])
-        F1_multicls[cls_idx] = 2*Precision_multicls*Recall_multicls / (Precision_multicls + Recall_multicls)            
+        Precision_multicls = safe_divide(TP_all_multicls[cls_idx], TP_all_multicls[cls_idx] + FP_all_multicls[cls_idx])
+        Recall_multicls = safe_divide(TP_all_multicls[cls_idx], TP_all_multicls[cls_idx] + FN_all_multicls[cls_idx])
+        F1_multicls[cls_idx] = safe_divide(2 * Precision_multicls * Recall_multicls, Precision_multicls + Recall_multicls)
 
     return AUC_cls, ACC_cls, EER_cls, \
         MAP.item(), OP, OR, OF1, CP, CR, CF1, F1_multicls, \

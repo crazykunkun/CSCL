@@ -475,11 +475,14 @@ def evaluation(args, model, data_loader, tokenizer, device, config, logger=None)
     IOU_ACC_75 = sum(IOU_75)/len(IOU_75)
     IOU_ACC_95 = sum(IOU_95)/len(IOU_95)
 
+    def safe_divide(numerator, denominator):
+        return numerator / denominator if denominator != 0 else 0.0
+
     # ##================= token cls========================##
-    ACC_tok = (TP_all + TN_all) / (TP_all + TN_all + FP_all + FN_all)
-    Precision_tok = TP_all / (TP_all + FP_all)
-    Recall_tok = TP_all / (TP_all + FN_all)
-    F1_tok = 2*Precision_tok*Recall_tok / (Precision_tok + Recall_tok)
+    ACC_tok = safe_divide(TP_all + TN_all, TP_all + TN_all + FP_all + FN_all)
+    Precision_tok = safe_divide(TP_all, TP_all + FP_all)
+    Recall_tok = safe_divide(TP_all, TP_all + FN_all)
+    F1_tok = safe_divide(2 * Precision_tok * Recall_tok, Precision_tok + Recall_tok)
 
     return AUC_cls, ACC_cls, EER_cls, \
            MAP.item(), OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \

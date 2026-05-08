@@ -209,6 +209,8 @@ class AveragePrecisionMeter(object):
             total_count += 1
             if label == 1:
                 precision_at_i += pos_count / total_count
+        if pos_count == 0:
+            return 0.0
         precision_at_i /= pos_count
         return precision_at_i
 
@@ -252,5 +254,4 @@ class AveragePrecisionMeter(object):
         CR = np.sum(Nc / Ng) / n_class
         CF1 = (2 * CP * CR) / (CP + CR)
         return OP, OR, OF1, CP, CR, CF1
-
 
